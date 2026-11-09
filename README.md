@@ -63,6 +63,16 @@ The debug package allows cleartext at the platform layer so a private-host HTTP 
 
 `tools/build-apk.sh` prints the APK path, SHA-256, `versionName`, and `minSdk`.
 
+
+## Screenshots
+
+0.6.4 (fixture demo; Connect, Sessions, open session — dark and light):
+
+| Connect | Sessions | Session |
+|---|---|---|
+| ![Connect dark](docs/screenshots/connect-dark.png) | ![Sessions dark](docs/screenshots/sessions-dark.png) | ![Session dark](docs/screenshots/session-dark.png) |
+| ![Connect light](docs/screenshots/connect-light.png) | ![Sessions light](docs/screenshots/sessions-light.png) | ![Session light](docs/screenshots/session-light.png) |
+
 ## Credit
 
 Originally built by Amniscient
