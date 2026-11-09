@@ -1,0 +1,1292 @@
+namespace app;
+import json;
+import base64;
+import net.sock;
+import os;
+
+// Copyright 2026 Amniscient. SPDX-License-Identifier: MIT
+// Unofficial OpenCode companion core.
+// This file is part of the companion and is MIT. The Helium compiler that
+// builds it is a separate Apache-2.0 project and is not vendored here.
+// The core owns the session model, the documented HTTP contract, demo fixtures,
+// permission decisions, and the view model. The Android shell only draws this
+// model, stores the password in the Keystore, and performs TLS.
+
+fn credit() const byte[:] { return "Originally built by Amniscient"; }
+
+struct Row {
+	role int,
+	off int,
+	n int,
+	loff int,
+	ln int,
+	noff int,
+	nn int,
+	ioff int,
+	ni int,
+	state int
+}
+struct Named {
+	off int,
+	n int,
+	aoff int,
+	an int,
+	boff int,
+	bn int,
+	flag int,
+	when int
+}
+
+var SCREEN byte[>..] = [];
+var BANNER byte[>..] = [];
+var ERR byte[>..] = [];
+var STATUS byte[>..] = [];
+var URL byte[>..] = [];
+var HOST byte[>..] = [];
+var META byte[>..] = [];
+var TEXT byte[>..] = [];
+var SECRET byte[>..] = [];
+var ACTIVE byte[>..] = [];
+var PROJS Named[>..] = [];
+var SESS Named[>..] = [];
+var ROWS Row[>..] = [];
+var PERM_ON bool = false;
+var PERM_ID byte[>..] = [];
+var PERM_ACTION byte[>..] = [];
+var PERM_RES byte[>..] = [];
+var PERM_MSG byte[>..] = [];
+var REQ_ON bool = false;
+var REQ_STREAM bool = false;
+var REQ_HTTPS bool = true;
+var REQ_PORT int = 0;
+var REQ_TAG byte[>..] = [];
+var REQ_METHOD byte[>..] = [];
+var REQ_PATH byte[>..] = [];
+var REQ_BODY byte[>..] = [];
+var DEMO bool = false;
+var LOCAL bool = false;
+var RUNNING bool = false;
+var PASS int = 0;
+var FAIL int = 0;
+
+fn set_buf(dst byte[>..]&, s const byte[:]) {
+	dst.clear();
+	dst.append(s);
+}
+fn starts(s const byte[:], p const byte[:]) bool {
+	if s.len < p.len { return false; }
+	for i in p.len {
+		if s[i] != p[i] { return false; }
+	}
+	return true;
+}
+fn contains(hay const byte[:], needle const byte[:]) bool {
+	if needle.len == 0 { return true; }
+	if hay.len < needle.len { return false; }
+	for i in hay.len - needle.len + 1 {
+		var ok = true;
+		for j in needle.len {
+			if hay[i + j] != needle[j] { ok = false; }
+		}
+		if ok { return true; }
+	}
+	return false;
+}
+fn keep(pool byte[>..]&, s const byte[:]) int, int {
+	let o = pool.len;
+	pool.append(s);
+	return o, s.len;
+}
+fn piece(pool const byte[:], off int, n int) const byte[:] {
+	if off < 0 || n <= 0 || off + n > pool.len { return ""; }
+	return pool[off..off + n];
+}
+fn hex_digit(v int) byte {
+	let d = v & 15;
+	if d < 10 { return ('0' as int + d) as! byte; }
+	return ('a' as int + d - 10) as! byte;
+}
+fn append_id(out byte[>..]&, id const byte[:]) {
+	for c in id {
+		let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+		if ok { out.push(c); }
+		else {
+			out.push('%');
+			out.push(hex_digit((c as int) >> 4));
+			out.push(hex_digit(c as int));
+		}
+	}
+}
+fn private_host(h const byte[:]) bool {
+	if h == "localhost" || h == "127.0.0.1" || h == "10.0.2.2" || h == "[::1]" { return true; }
+	var parts int[4] = [0, 0, 0, 0];
+	var n = 0;
+	var cur = 0;
+	var digits = 0;
+	for c in h {
+		if c == '.' {
+			if digits == 0 || n >= 3 { return false; }
+			parts[n] = cur;
+			n += 1;
+			cur = 0;
+			digits = 0;
+		} else if c >= '0' && c <= '9' {
+			cur = cur * 10 + (c - '0') as int;
+			digits += 1;
+			if digits > 3 || cur > 255 { return false; }
+		} else { return false; }
+	}
+	if digits == 0 || n != 3 { return false; }
+	parts[3] = cur;
+	if parts[0] == 10 || parts[0] == 127 { return true; }
+	if parts[0] == 192 && parts[1] == 168 { return true; }
+	if parts[0] == 172 && parts[1] >= 16 && parts[1] <= 31 { return true; }
+	if parts[0] == 169 && parts[1] == 254 { return true; }
+	if parts[0] == 100 && parts[1] >= 64 && parts[1] <= 127 { return true; }
+	return false;
+}
+
+// 1 = usable origin. HTTP is refused unless local development is on and the host is private.
+fn classify(url const byte[:], local bool, host byte[>..]&, port int&, https bool&) int {
+	host.clear();
+	port = 0;
+	https = true;
+	if url.len == 0 || url.len > 512 { return 0; }
+	var i = 0;
+	if starts(url, "https://") { https = true; i = 8; }
+	else if starts(url, "http://") { https = false; i = 7; }
+	else { return 0; }
+	var end = i;
+	while end < url.len && url[end] != '/' && url[end] != '?' && url[end] != '#' {
+		if url[end] == '@' || url[end] == ' ' { return 0; }
+		end += 1;
+	}
+	var pstart = -1;
+	if i < url.len && url[i] == '[' {
+		var k = i;
+		while k < end && url[k] != ']' { k += 1; }
+		if k >= end || url[k] != ']' { return 0; }
+		host.append(url[i..k + 1]);
+		if k + 1 < end {
+			if url[k + 1] != ':' { return 0; }
+			pstart = k + 2;
+		}
+	} else {
+		var k = i;
+		while k < end && url[k] != ':' { k += 1; }
+		if k == i { return 0; }
+		host.append(url[i..k]);
+		if k < end && url[k] == ':' { pstart = k + 1; }
+	}
+	if pstart >= 0 {
+		if pstart >= end { return 0; }
+		let v, ok = parse_int(url[pstart..end]);
+		if !ok || v < 1 || v > 65535 { return 0; }
+		port = v;
+	} else { port = if https { 443 } else { 80 }; }
+	if host.len == 0 { return 0; }
+	if !https {
+		if !local || !private_host(host[..]) { return 0; }
+	}
+	return 1;
+}
+
+fn copy_member(d json::Doc&, n int, key const byte[:], dest byte[>..]&) bool {
+	let m = json::member(d, n, key);
+	let s, ok = json::as_string(d, m);
+	if !ok { return false; }
+	dest.clear();
+	dest.append(s);
+	return true;
+}
+fn member_string(d json::Doc&, n int, key const byte[:]) bool {
+	let m = json::member(d, n, key);
+	let s, ok = json::as_string(d, m);
+	return ok && s.len >= 0;
+}
+fn str_at(d json::Doc&, n int) const byte[:] {
+	let s, ok = json::as_string(d, n);
+	if ok { return s; }
+	return "";
+}
+
+fn clear_request() { REQ_ON = false; REQ_STREAM = false; }
+fn set_request(tag const byte[:], method const byte[:], path const byte[:], body const byte[:], stream bool) {
+	set_buf(REQ_TAG, tag);
+	set_buf(REQ_METHOD, method);
+	set_buf(REQ_PATH, path);
+	set_buf(REQ_BODY, body);
+	REQ_STREAM = stream;
+	REQ_HTTPS = URL.len == 0 || starts(URL[..], "https://");
+	REQ_PORT = 0;
+	var host byte[>..] = [];
+	var https = true;
+	if classify(URL[..], LOCAL, host, REQ_PORT, https) == 1 { REQ_HTTPS = https; }
+	REQ_ON = true;
+}
+fn set_error(msg const byte[:]) {
+	set_buf(ERR, msg);
+	set_buf(STATUS, "error");
+}
+fn push_row(role int, text const byte[:], lang const byte[:], name const byte[:], id const byte[:], state int) {
+	if ROWS.len >= 160 { return; }
+	let o, n = keep(TEXT, text);
+	let lo, ln = keep(TEXT, lang);
+	let no, nn = keep(TEXT, name);
+	let io, ni = keep(TEXT, id);
+	ROWS.push(Row { role: role, off: o, n: n, loff: lo, ln: ln, noff: no, nn: nn, ioff: io, ni: ni, state: state });
+}
+fn add_prose(role int, text const byte[:]) {
+	if text.len == 0 { return; }
+	var i = 0;
+	var seg = 0;
+	var code = false;
+	var lang byte[>..] = [];
+	while i < text.len {
+		if i + 2 < text.len && text[i] == '`' && text[i + 1] == '`' && text[i + 2] == '`' {
+			let chunk = text[seg..i];
+			if code {
+				if chunk.len > 0 { push_row(3, chunk, lang[..], "", "", 0); }
+			} else if chunk.len > 0 { push_row(role, chunk, "", "", "", 0); }
+			i += 3;
+			lang.clear();
+			while i < text.len && text[i] != '\n' && text[i] != '\r' {
+				lang.push(text[i]);
+				i += 1;
+			}
+			if i < text.len && text[i] == '\r' { i += 1; }
+			if i < text.len && text[i] == '\n' { i += 1; }
+			code = !code;
+			seg = i;
+		} else { i += 1; }
+	}
+	if seg < text.len || !code {
+		let chunk = text[seg..];
+		if chunk.len > 0 {
+			if code { push_row(3, chunk, lang[..], "", "", 0); }
+			else { push_row(role, chunk, "", "", "", 0); }
+		}
+	}
+}
+fn find_row(id const byte[:]) int {
+	for r, i in ROWS {
+		if piece(TEXT[..], r.ioff, r.ni) == id { return i; }
+	}
+	return -1;
+}
+fn append_row_text(i int, extra const byte[:]) {
+	if i < 0 || extra.len == 0 { return; }
+	let r = ROWS[i];
+	var tmp byte[>..] = [];
+	tmp.append(piece(TEXT[..], r.off, r.n));
+	tmp.append(extra);
+	let o, n = keep(TEXT, tmp[..]);
+	ROWS[i].off = o;
+	ROWS[i].n = n;
+}
+
+fn reset() {
+	SCREEN.clear();
+	SCREEN.append("connect");
+	BANNER.clear();
+	BANNER.append("Unofficial prototype for OpenCode. Not released or endorsed by Anomaly.");
+	ERR.clear();
+	STATUS.clear();
+	STATUS.append("idle");
+	URL.clear();
+	HOST.clear();
+	META.clear();
+	TEXT.clear();
+	ACTIVE.clear();
+	PROJS.clear();
+	SESS.clear();
+	ROWS.clear();
+	PERM_ON = false;
+	PERM_ID.clear();
+	PERM_ACTION.clear();
+	PERM_RES.clear();
+	PERM_MSG.clear();
+	clear_request();
+	DEMO = false;
+	LOCAL = false;
+	RUNNING = false;
+}
+
+fn load_demo() {
+	reset();
+	DEMO = true;
+	set_buf(SCREEN, "projects");
+	set_buf(STATUS, "demo");
+	set_buf(BANNER, "Local demo fixtures. Not a live OpenCode server.");
+	set_buf(URL, "demo://fixtures");
+	META.clear();
+	let n1, nn1 = keep(META, "Fixture notes");
+	let p1, pn1 = keep(META, "/demo/notes");
+	let i1, in1 = keep(META, "demo-project-notes");
+	PROJS.push(Named { off: n1, n: nn1, aoff: p1, an: pn1, boff: i1, bn: in1, flag: 0, when: 0 });
+	let n2, nn2 = keep(META, "Fixture app");
+	let p2, pn2 = keep(META, "/demo/app");
+	let i2, in2 = keep(META, "demo-project-app");
+	PROJS.push(Named { off: n2, n: nn2, aoff: p2, an: pn2, boff: i2, bn: in2, flag: 0, when: 0 });
+	let t1, tn1 = keep(META, "Read the fixture README");
+	let s1, sn1 = keep(META, "demo-session-readme");
+	let q1, qn1 = keep(META, "demo-project-notes");
+	SESS.push(Named { off: t1, n: tn1, aoff: s1, an: sn1, boff: q1, bn: qn1, flag: 1, when: 0 });
+	let t2, tn2 = keep(META, "Idle fixture");
+	let s2, sn2 = keep(META, "demo-session-idle");
+	let q2, qn2 = keep(META, "demo-project-app");
+	SESS.push(Named { off: t2, n: tn2, aoff: s2, an: sn2, boff: q2, bn: qn2, flag: 0, when: 0 });
+	open_demo_session();
+}
+fn open_demo_session() {
+	TEXT.clear();
+	ROWS.clear();
+	set_buf(ACTIVE, "demo-session-readme");
+	set_buf(SCREEN, "session");
+	RUNNING = true;
+	add_prose(1, "Show the fixture README and stop before any command.");
+	push_row(6, "Fixture reasoning. The companion is not calling a model.", "", "", "", 0);
+	add_prose(2, "This is fixture text from the companion, not a model reply. The sample below is local code.\n```\nfn greet() {\n  print(\"hello from the fixture\");\n}\n```");
+	push_row(4, "status: needs an explicit decision before anything runs", "", "read", "demo-tool-1", 2);
+	push_row(5, "Fixture status. No server is connected.", "", "", "", 0);
+	push_row(7, "Fixture error. Nothing was sent.", "", "", "", 0);
+	PERM_ON = true;
+	set_buf(PERM_ID, "demo-perm-1");
+	set_buf(PERM_ACTION, "bash");
+	set_buf(PERM_RES, "npm test");
+	set_buf(PERM_MSG, "Fixture only. Allowing records your tap. It does not run a command.");
+}
+
+fn take_projects(body const byte[:]) {
+	var d json::Doc;
+	let root, err = json::parse(body, d);
+	if root < 0 || json::kind(d, root) != 5 {
+		set_error("Project list was not a JSON array.");
+		return;
+	}
+	META.clear();
+	PROJS.clear();
+	SESS.clear();
+	let n = json::count(d, root);
+	for i in n {
+		let el = json::element(d, root, i);
+		var name byte[>..] = [];
+		var path byte[>..] = [];
+		var id byte[>..] = [];
+		copy_member(d, el, "id", id);
+		let loc = json::member(d, el, "canonical");
+		let ps, pok = json::as_string(d, loc);
+		if pok { path.append(ps); }
+		else { copy_member(d, el, "canonical", path); }
+		if !copy_member(d, el, "name", name) || name.len == 0 {
+			var slash = 0;
+			for i in path.len { if path[i] == '/' { slash = i + 1; } }
+			if slash < path.len { name.append(path[slash..]); }
+			else if path.len > 0 { name.append(path[..]); }
+			else { name.append("Project"); }
+		}
+		let a, an = keep(META, name[..]);
+		let b, bn = keep(META, path[..]);
+		let c, cn = keep(META, id[..]);
+		PROJS.push(Named { off: a, n: an, aoff: b, an: bn, boff: c, bn: cn, flag: 0, when: 0 });
+	}
+	set_buf(SCREEN, "projects");
+	set_buf(STATUS, "live");
+	ERR.clear();
+}
+fn take_sessions(body const byte[:]) {
+	var d json::Doc;
+	let root, err = json::parse(body, d);
+	let data = json::member(d, root, "data");
+	if root < 0 || data < 0 {
+		set_error("Session list was not a SessionsResponse.");
+		return;
+	}
+	// Projects stay in META. Append sessions after them.
+	SESS.clear();
+	let n = json::count(d, data);
+	for i in n {
+		let el = json::element(d, data, i);
+		var title byte[>..] = [];
+		var id byte[>..] = [];
+		var proj byte[>..] = [];
+		copy_member(d, el, "id", id);
+		if !copy_member(d, el, "title", title) { title.append("Untitled session"); }
+		copy_member(d, el, "projectID", proj);
+		var when = 0;
+		let clock = json::member(d, el, "time");
+		if clock >= 0 {
+			let up = json::member(d, clock, "updated");
+			let uv, uok = json::as_i64(d, up);
+			if uok { when = uv; }
+			else {
+				let cr = json::member(d, clock, "created");
+				let cv, cok = json::as_i64(d, cr);
+				if cok { when = cv; }
+			}
+		}
+		var mark = 0;
+		var state byte[>..] = [];
+		if copy_member(d, el, "status", state) {
+			if state == "running" || state == "busy" { mark = 1; }
+		}
+		let a, an = keep(META, title[..]);
+		let b, bn = keep(META, id[..]);
+		let c, cn = keep(META, proj[..]);
+		SESS.push(Named { off: a, n: an, aoff: b, an: bn, boff: c, bn: cn, flag: mark, when: when });
+	}
+	set_buf(STATUS, "live");
+	ERR.clear();
+}
+fn tool_blurb(d json::Doc&, state int) byte[>..] {
+	var out byte[>..] = [];
+	let status = json::member(d, state, "status");
+	let ss, sok = json::as_string(d, status);
+	if sok { out.append(ss); }
+	let content = json::member(d, state, "content");
+	if content >= 0 {
+		let n = json::count(d, content);
+		for i in n {
+			let el = json::element(d, content, i);
+			let typ = json::member(d, el, "type");
+			let ts, tok = json::as_string(d, typ);
+			if tok && ts == "text" {
+				let tx = json::member(d, el, "text");
+				let body, bok = json::as_string(d, tx);
+				if bok && body.len > 0 {
+					if out.len > 0 { out.append(" — "); }
+					if body.len > 240 { out.append(body[..240]); }
+					else { out.append(body); }
+				}
+			}
+		}
+	}
+	let err = json::member(d, state, "error");
+	if err >= 0 {
+		let msg = json::member(d, err, "message");
+		let ms, mok = json::as_string(d, msg);
+		if mok {
+			if out.len > 0 { out.append(" — "); }
+			out.append(ms);
+		}
+	}
+	return out;
+}
+fn take_messages(body const byte[:]) {
+	var d json::Doc;
+	let root, err = json::parse(body, d);
+	let data = json::member(d, root, "data");
+	if root < 0 || data < 0 {
+		set_error("Message list was not a SessionMessagesResponse.");
+		return;
+	}
+	TEXT.clear();
+	ROWS.clear();
+	let n = json::count(d, data);
+	for i in n {
+		let el = json::element(d, data, i);
+		var typ byte[>..] = [];
+		copy_member(d, el, "type", typ);
+		if typ == "user" || typ == "synthetic" || typ == "system" {
+			var text byte[>..] = [];
+			copy_member(d, el, "text", text);
+			let role = if typ == "user" { 1 } else { 5 };
+			add_prose(role, text[..]);
+		} else if typ == "assistant" {
+			let content = json::member(d, el, "content");
+			let cn = json::count(d, content);
+			for j in cn {
+				let part = json::element(d, content, j);
+				var pt byte[>..] = [];
+				copy_member(d, part, "type", pt);
+				if pt == "reasoning" {
+					var text byte[>..] = [];
+					copy_member(d, part, "text", text);
+					add_prose(6, text[..]);
+				} else if pt == "text" {
+					var text byte[>..] = [];
+					copy_member(d, part, "text", text);
+					add_prose(2, text[..]);
+				} else if pt == "tool" {
+					var name byte[>..] = [];
+					var id byte[>..] = [];
+					if !copy_member(d, part, "name", name) { name.append("tool"); }
+					copy_member(d, part, "id", id);
+					let state = json::member(d, part, "state");
+					var st byte[>..] = [];
+					copy_member(d, state, "status", st);
+					var code = 1;
+					if st == "completed" { code = 2; }
+					else if st == "error" { code = 3; }
+					let blur = tool_blurb(d, state);
+					push_row(4, blur[..], "", name[..], id[..], code);
+				}
+			}
+		} else if typ == "shell" {
+			var cmd byte[>..] = [];
+			copy_member(d, el, "command", cmd);
+			push_row(4, cmd[..], "", "shell", "", 1);
+		} else if typ == "idle" {
+			var outcome byte[>..] = [];
+			copy_member(d, el, "outcome", outcome);
+			if outcome == "failed" || outcome == "interrupted" { push_row(5, outcome[..], "", "", "", 0); }
+			RUNNING = false;
+		}
+	}
+	set_buf(SCREEN, "session");
+	set_buf(STATUS, "live");
+	ERR.clear();
+	set_request("events", "GET", "/api/event", "", true);
+}
+fn take_info(status int, body const byte[:]) {
+	if status == 401 {
+		set_error("The server refused the password. Nothing was saved to logs.");
+		clear_request();
+		return;
+	}
+	if status < 200 || status >= 300 {
+		set_error("The server did not return info.");
+		clear_request();
+		return;
+	}
+	var d json::Doc;
+	let root, err = json::parse(body, d);
+	let ver = json::member(d, root, "version");
+	let vs, ok = json::as_string(d, ver);
+	if root < 0 || !ok {
+		set_error("Server info did not match ServerInfo.");
+		clear_request();
+		return;
+	}
+	var note byte[>..] = [];
+	note.append("Connected to OpenCode ");
+	note.append(vs);
+	note.append(". Unofficial client.");
+	set_buf(BANNER, note[..]);
+	set_buf(STATUS, "live");
+	ERR.clear();
+	set_buf(SCREEN, "projects");
+	set_request("projects", "GET", "/api/project", "", false);
+}
+fn on_http(status int, tag const byte[:], body const byte[:], error const byte[:]) {
+	clear_request();
+	if error.len > 0 {
+		set_error(error);
+		return;
+	}
+	if tag == "info" { take_info(status, body); return; }
+	if status == 401 {
+		set_error("Unauthorized. Check the password for this server.");
+		return;
+	}
+	if tag == "projects" { take_projects(body); set_request("sessions", "GET", "/api/session?limit=50&order=desc", "", false); return; }
+	if tag == "sessions" { take_sessions(body); return; }
+	if tag == "messages" { take_messages(body); return; }
+	if tag == "prompt" {
+		if status < 200 || status >= 300 { set_error("The server did not accept the message."); return; }
+		RUNNING = true;
+		set_buf(STATUS, "live");
+		return;
+	}
+	if tag == "interrupt" {
+		RUNNING = false;
+		push_row(5, "Interrupt requested.", "", "", "", 0);
+		set_buf(STATUS, "live");
+		return;
+	}
+	if tag == "permission" {
+		if status != 204 && (status < 200 || status >= 300) {
+			set_error("The server did not accept the permission decision.");
+			return;
+		}
+		PERM_ON = false;
+		push_row(5, "Permission decision sent. No command was started by this app.", "", "", "", 0);
+		return;
+	}
+	set_error("Unexpected response.");
+}
+fn on_event(body const byte[:]) {
+	var d json::Doc;
+	let root, err = json::parse(body, d);
+	if root < 0 { return; }
+	var typ byte[>..] = [];
+	if !copy_member(d, root, "type", typ) { return; }
+	let data = json::member(d, root, "data");
+	if typ == "server.connected" {
+		set_buf(STATUS, "live");
+		if ERR.len == 0 { set_buf(BANNER, "Live event stream. Missed events are not replayed; reopen a session to resync."); }
+		return;
+	}
+	var sid byte[>..] = [];
+	copy_member(d, data, "sessionID", sid);
+	if ACTIVE.len > 0 && sid.len > 0 && sid[..] != ACTIVE[..] { return; }
+	if typ == "session.text.started" {
+		RUNNING = true;
+		var mid byte[>..] = [];
+		copy_member(d, data, "assistantMessageID", mid);
+		push_row(2, "", "", "", mid[..], 0);
+		return;
+	}
+	if typ == "session.text.delta" {
+		var mid byte[>..] = [];
+		var delta byte[>..] = [];
+		copy_member(d, data, "assistantMessageID", mid);
+		copy_member(d, data, "delta", delta);
+		var ix = find_row(mid[..]);
+		if ix < 0 {
+			push_row(2, delta[..], "", "", mid[..], 0);
+		} else { append_row_text(ix, delta[..]); }
+		return;
+	}
+	if typ == "session.text.ended" {
+		var mid byte[>..] = [];
+		var text byte[>..] = [];
+		copy_member(d, data, "assistantMessageID", mid);
+		copy_member(d, data, "text", text);
+		let ix = find_row(mid[..]);
+		if ix < 0 { add_prose(2, text[..]); }
+		else if ROWS[ix].n == 0 { append_row_text(ix, text[..]); }
+		return;
+	}
+	if typ == "session.tool.called" || typ == "session.tool.success" || typ == "session.tool.failed" || typ == "session.tool.progress" {
+		var id byte[>..] = [];
+		copy_member(d, data, "id", id);
+		var code = 1;
+		if typ == "session.tool.success" { code = 2; }
+		if typ == "session.tool.failed" { code = 3; }
+		let ix = find_row(id[..]);
+		if ix < 0 { push_row(4, typ[..], "", "tool", id[..], code); }
+		else { ROWS[ix].state = code; }
+		return;
+	}
+	if typ == "permission.asked" {
+		copy_member(d, data, "id", PERM_ID);
+		copy_member(d, data, "action", PERM_ACTION);
+		PERM_RES.clear();
+		let res = json::member(d, data, "resources");
+		let rn = json::count(d, res);
+		for i in rn {
+			if i > 0 { PERM_RES.append(", "); }
+			let el = json::element(d, res, i);
+			let s, ok = json::as_string(d, el);
+			if ok { PERM_RES.append(s); }
+		}
+		if !copy_member(d, data, "message", PERM_MSG) {
+			set_buf(PERM_MSG, "The server is waiting. Nothing runs until you choose.");
+		}
+		PERM_ON = true;
+		return;
+	}
+	if typ == "permission.replied" {
+		var id byte[>..] = [];
+		copy_member(d, data, "requestID", id);
+		if id[..] == PERM_ID[..] { PERM_ON = false; }
+		return;
+	}
+	if typ == "session.execution.started" { RUNNING = true; set_buf(STATUS, "live"); return; }
+	if typ == "session.execution.succeeded" || typ == "session.execution.failed" || typ == "session.execution.interrupted" {
+		RUNNING = false;
+		push_row(5, typ[..], "", "", "", 0);
+		return;
+	}
+}
+fn open_session(id const byte[:]) {
+	if DEMO {
+		if id == "demo-session-readme" { open_demo_session(); return; }
+		TEXT.clear();
+		ROWS.clear();
+		set_buf(ACTIVE, id);
+		set_buf(SCREEN, "session");
+		RUNNING = false;
+		PERM_ON = false;
+		add_prose(5, "Idle fixture session. There is no live server.");
+		return;
+	}
+	set_buf(ACTIVE, id);
+	TEXT.clear();
+	ROWS.clear();
+	PERM_ON = false;
+	var path byte[>..] = [];
+	path.append("/api/session/");
+	append_id(path, id);
+	path.append("/message?limit=80&order=asc");
+	set_request("messages", "GET", path[..], "", false);
+	set_buf(SCREEN, "session");
+	set_buf(STATUS, "connecting");
+}
+fn send_text(text const byte[:]) { send_prompt(text, text); }
+fn send_prompt(shown const byte[:], wire const byte[:]) {
+	if ACTIVE.len == 0 { set_error("Open a session before sending."); return; }
+	if shown.len == 0 { return; }
+	add_prose(1, shown);
+	if DEMO {
+		add_prose(2, "Demo mode does not call a model or a server. Your message stays on this device.");
+		RUNNING = false;
+		return;
+	}
+	let payload = if wire.len > 0 { wire } else { shown };
+	var body byte[>..] = [];
+	body.append("{\"text\":");
+	json::format_string(body, payload);
+	body.append("}");
+	var path byte[>..] = [];
+	path.append("/api/session/");
+	append_id(path, ACTIVE[..]);
+	path.append("/prompt");
+	set_request("prompt", "POST", path[..], body[..], false);
+	RUNNING = true;
+}
+fn interrupt() {
+	if DEMO {
+		RUNNING = false;
+		push_row(5, "Stopped in the demo. No server command was running.", "", "", "", 0);
+		return;
+	}
+	if ACTIVE.len == 0 { return; }
+	var path byte[>..] = [];
+	path.append("/api/session/");
+	append_id(path, ACTIVE[..]);
+	path.append("/interrupt?resume=false");
+	set_request("interrupt", "POST", path[..], "", false);
+}
+fn decide(id const byte[:], decision const byte[:]) {
+	if decision != "once" && decision != "always" && decision != "reject" {
+		set_error("Decision must be once, always, or reject.");
+		return;
+	}
+	if !PERM_ON || (id.len > 0 && id != PERM_ID[..]) {
+		set_error("There is no matching permission request.");
+		return;
+	}
+	if DEMO {
+		PERM_ON = false;
+		RUNNING = false;
+		var note byte[>..] = [];
+		note.append("Recorded ");
+		note.append(decision);
+		note.append(" for the fixture. No command ran and nothing was sent.");
+		push_row(5, note[..], "", "", "", 0);
+		clear_request();
+		return;
+	}
+	var body byte[>..] = [];
+	body.append("{\"decision\":");
+	json::format_string(body, decision);
+	body.append("}");
+	var path byte[>..] = [];
+	path.append("/api/session/");
+	append_id(path, ACTIVE[..]);
+	path.append("/permission/");
+	append_id(path, PERM_ID[..]);
+	path.append("/reply");
+	set_request("permission", "POST", path[..], body[..], false);
+	PERM_ON = false;
+}
+
+fn apply(event const byte[:]) {
+	var d json::Doc;
+	let root, err = json::parse(event, d);
+	if root < 0 {
+		set_error("Could not read the companion event.");
+		return;
+	}
+	var op byte[>..] = [];
+	if !copy_member(d, root, "op", op) {
+		set_error("Missing op.");
+		return;
+	}
+	if op == "boot" { reset(); return; }
+	if op == "demo" { load_demo(); return; }
+	if op == "connect" {
+		var url byte[>..] = [];
+		copy_member(d, root, "url", url);
+		let localm = json::member(d, root, "local");
+		let lb, lok = json::as_bool(d, localm);
+		LOCAL = lok && lb;
+		var host byte[>..] = [];
+		var port = 0;
+		var https = true;
+		if classify(url[..], LOCAL, host, port, https) != 1 {
+			set_buf(URL, url[..]);
+			set_error("Use https:// for a server you control. HTTP is only for a private address with local development on.");
+			clear_request();
+			return;
+		}
+		set_buf(URL, url[..]);
+		set_buf(HOST, host[..]);
+		DEMO = false;
+		set_buf(SCREEN, "connect");
+		set_buf(STATUS, "connecting");
+		ERR.clear();
+		set_buf(BANNER, "Connecting to your OpenCode server. Unofficial prototype.");
+		set_request("info", "GET", "/api/info", "", false);
+		return;
+	}
+	if op == "http" {
+		let stn = json::member(d, root, "status");
+		let st, sok = json::as_i64(d, stn);
+		var tag byte[>..] = [];
+		var body byte[>..] = [];
+		var error byte[>..] = [];
+		copy_member(d, root, "tag", tag);
+		copy_member(d, root, "body", body);
+		copy_member(d, root, "error", error);
+		on_http(if sok { st } else { 0 }, tag[..], body[..], error[..]);
+		return;
+	}
+	if op == "sse" {
+		var body byte[>..] = [];
+		copy_member(d, root, "body", body);
+		on_event(body[..]);
+		return;
+	}
+	if op == "stream" {
+		var state byte[>..] = [];
+		copy_member(d, root, "state", state);
+		if state == "open" { clear_request(); set_buf(STATUS, "live"); }
+		else if state == "closed" { set_buf(STATUS, "reconnecting"); set_buf(ERR, "Event stream closed. Reconnect to resume. Missed events are not replayed."); }
+		else {
+			var error byte[>..] = [];
+			copy_member(d, root, "error", error);
+			if error.len == 0 { set_error("Event stream failed."); }
+			else { set_error(error[..]); }
+			set_buf(STATUS, "reconnecting");
+		}
+		return;
+	}
+	if op == "ui" {
+		var action byte[>..] = [];
+		copy_member(d, root, "action", action);
+		if action == "send" {
+			var text byte[>..] = [];
+			var wire byte[>..] = [];
+			copy_member(d, root, "text", text);
+			copy_member(d, root, "wire", wire);
+			if wire.len > 0 { send_prompt(text[..], wire[..]); }
+			else { send_text(text[..]); }
+			return;
+		}
+		if action == "interrupt" { interrupt(); return; }
+		if action == "open-session" {
+			var id byte[>..] = [];
+			copy_member(d, root, "id", id);
+			open_session(id[..]);
+			return;
+		}
+		if action == "screen" {
+			var name byte[>..] = [];
+			copy_member(d, root, "name", name);
+			if name == "connect" || name == "projects" || name == "session" || name == "about" { set_buf(SCREEN, name[..]); }
+			return;
+		}
+		if action == "permission" {
+			var id byte[>..] = [];
+			var decision byte[>..] = [];
+			copy_member(d, root, "id", id);
+			copy_member(d, root, "decision", decision);
+			decide(id[..], decision[..]);
+			return;
+		}
+		if action == "reconnect" {
+			if DEMO { set_buf(STATUS, "demo"); return; }
+			set_request("events", "GET", "/api/event", "", true);
+			set_buf(STATUS, "connecting");
+			ERR.clear();
+			return;
+		}
+		if action == "dismiss" { ERR.clear(); return; }
+	}
+}
+
+fn json_named(out byte[>..]&, item Named, pool const byte[:]) {
+	out.append("{\"title\":");
+	json::format_string(out, piece(pool, item.off, item.n));
+	out.append(",\"id\":");
+	json::format_string(out, piece(pool, item.aoff, item.an));
+	out.append(",\"extra\":");
+	json::format_string(out, piece(pool, item.boff, item.bn));
+	out.append(",\"flag\":");
+	json::format_int(out, item.flag);
+	out.append(",\"when\":");
+	json::format_int(out, item.when);
+	out.push('}');
+}
+fn render(out byte[>..]&) {
+	out.clear();
+	out.append("{\"screen\":");
+	json::format_string(out, SCREEN[..]);
+	out.append(",\"demo\":");
+	json::format_bool(out, DEMO);
+	out.append(",\"banner\":");
+	json::format_string(out, BANNER[..]);
+	out.append(",\"status\":");
+	json::format_string(out, STATUS[..]);
+	out.append(",\"error\":");
+	json::format_string(out, ERR[..]);
+	out.append(",\"credit\":");
+	json::format_string(out, credit());
+	out.append(",\"about\":[");
+	json::format_string(out, "Unofficial prototype for OpenCode");
+	out.push(',');
+	json::format_string(out, credit());
+	out.push(',');
+	json::format_string(out, "This app is not OpenCode and is not released or endorsed by Anomaly.");
+	out.push(',');
+	json::format_string(out, "OpenCode is a project of Anomaly. https://opencode.ai");
+	out.push(',');
+	json::format_string(out, "Upstream source: https://github.com/anomalyco/opencode");
+	out.push(',');
+	json::format_string(out, "OpenCode is MIT licensed. Copyright (c) 2025 opencode.");
+	out.push(',');
+	json::format_string(out, "The interface is an original layout and does not use OpenCode logo files.");
+	out.push(',');
+	json::format_string(out, "Session logic is Helium. The Android shell does TLS, Keystore, and touch layout.");
+	out.append("],\"unofficial\":true,\"url\":");
+	json::format_string(out, URL[..]);
+	out.append(",\"local\":");
+	json::format_bool(out, LOCAL);
+	out.append(",\"running\":");
+	json::format_bool(out, RUNNING);
+	out.append(",\"activeSession\":");
+	json::format_string(out, ACTIVE[..]);
+	out.append(",\"composer\":");
+	json::format_bool(out, SCREEN[..] == "session");
+	out.append(",\"request\":");
+	if !REQ_ON { out.append("null"); }
+	else {
+		out.append("{\"tag\":");
+		json::format_string(out, REQ_TAG[..]);
+		out.append(",\"method\":");
+		json::format_string(out, REQ_METHOD[..]);
+		out.append(",\"path\":");
+		json::format_string(out, REQ_PATH[..]);
+		out.append(",\"body\":");
+		json::format_string(out, REQ_BODY[..]);
+		out.append(",\"stream\":");
+		json::format_bool(out, REQ_STREAM);
+		out.append(",\"https\":");
+		json::format_bool(out, REQ_HTTPS);
+		out.append(",\"host\":");
+		json::format_string(out, HOST[..]);
+		out.append(",\"port\":");
+		json::format_int(out, REQ_PORT);
+		out.push('}');
+	}
+	out.append(",\"projects\":[");
+	for item, i in PROJS {
+		if i > 0 { out.push(','); }
+		json_named(out, item, META[..]);
+	}
+	out.append("],\"sessions\":[");
+	for item, i in SESS {
+		if i > 0 { out.push(','); }
+		json_named(out, item, META[..]);
+	}
+	out.append("],\"rows\":[");
+	var shown = 0;
+	var start = 0;
+	if ROWS.len > 60 { start = ROWS.len - 60; }
+	for r, i in ROWS {
+		if i < start { continue; }
+		if shown > 0 { out.push(','); }
+		shown += 1;
+		out.append("{\"role\":");
+		var role byte[>..] = [];
+		if r.role == 1 { role.append("user"); }
+		else if r.role == 2 { role.append("assistant"); }
+		else if r.role == 3 { role.append("code"); }
+		else if r.role == 4 { role.append("tool"); }
+		else if r.role == 6 { role.append("reasoning"); }
+		else if r.role == 7 { role.append("error"); }
+		else { role.append("status"); }
+		json::format_string(out, role[..]);
+		out.append(",\"text\":");
+		json::format_string(out, piece(TEXT[..], r.off, r.n));
+		out.append(",\"lang\":");
+		json::format_string(out, piece(TEXT[..], r.loff, r.ln));
+		out.append(",\"name\":");
+		json::format_string(out, piece(TEXT[..], r.noff, r.nn));
+		out.append(",\"state\":");
+		json::format_int(out, r.state);
+		out.push('}');
+	}
+	out.append("],\"permission\":");
+	if !PERM_ON { out.append("null"); }
+	else {
+		out.append("{\"id\":");
+		json::format_string(out, PERM_ID[..]);
+		out.append(",\"action\":");
+		json::format_string(out, PERM_ACTION[..]);
+		out.append(",\"resources\":");
+		json::format_string(out, PERM_RES[..]);
+		out.append(",\"message\":");
+		json::format_string(out, PERM_MSG[..]);
+		out.push('}');
+	}
+	out.push('}');
+}
+
+fn check(name const byte[:], ok bool) {
+	if ok { PASS += 1; print("PASS ", name); }
+	else { FAIL += 1; print("FAIL ", name); }
+}
+fn run_unit() int {
+	PASS = 0;
+	FAIL = 0;
+	var host byte[>..] = [];
+	var port = 0;
+	var https = false;
+	check("https public", classify("https://opencode.example.com", false, host, port, https) == 1 && https && port == 443 && host[..] == "opencode.example.com");
+	check("https explicit port", classify("https://opencode.example.com:49374/extra", false, host, port, https) == 1 && port == 49374 && https);
+	check("http public refused", classify("http://opencode.example.com", true, host, port, https) == 0);
+	check("http loopback needs local", classify("http://127.0.0.1:49374", false, host, port, https) == 0);
+	check("http loopback local", classify("http://127.0.0.1:49374", true, host, port, https) == 1 && !https && port == 49374);
+	check("http emulator host", classify("http://10.0.2.2:4096", true, host, port, https) == 1 && port == 4096);
+	check("http lan", classify("http://192.168.1.20:49374", true, host, port, https) == 1);
+	check("http meshnet", classify("http://100.64.0.8:49374", true, host, port, https) == 1 && port == 49374);
+	check("http meshnet outside", classify("http://100.128.0.1:49374", true, host, port, https) == 0);
+	check("http 172 private", classify("http://172.16.4.2", true, host, port, https) == 1 && port == 80);
+	check("http 172 public range", classify("http://172.32.0.1", true, host, port, https) == 0);
+	check("http public ip local flag", classify("http://8.8.8.8", true, host, port, https) == 0);
+	check("userinfo refused", classify("https://user:secret@opencode.example.com", false, host, port, https) == 0);
+	check("missing scheme", classify("opencode.example.com", false, host, port, https) == 0);
+	reset();
+	var view byte[>..] = [];
+	render(view);
+	check("credit exact", contains(view[..], "\"credit\":\"Originally built by Amniscient\""));
+	check("boot has no request", contains(view[..], "\"request\":null"));
+	check("boot unofficial", contains(view[..], "Unofficial prototype"));
+	load_demo();
+	view.clear();
+	render(view);
+	check("demo banner", contains(view[..], "Local demo fixtures. Not a live OpenCode server."));
+	check("demo not live url", contains(view[..], "demo://fixtures") && !contains(view[..], "\"status\":\"live\""));
+	check("demo code row", contains(view[..], "\"role\":\"code\"") && contains(view[..], "hello from the fixture"));
+	check("demo permission waiting", contains(view[..], "demo-perm-1") && contains(view[..], "npm test"));
+	check("demo has no shell request", !contains(view[..], "/api/shell") && contains(view[..], "\"request\":null"));
+	apply("{\"op\":\"ui\",\"action\":\"permission\",\"id\":\"demo-perm-1\",\"decision\":\"once\"}");
+	view.clear();
+	render(view);
+	check("demo decision recorded", contains(view[..], "Recorded once"));
+	check("demo decision sent nothing", contains(view[..], "\"request\":null") && !contains(view[..], "/permission/"));
+	apply("{\"op\":\"ui\",\"action\":\"send\",\"text\":\"ping fixture\"}");
+	view.clear();
+	render(view);
+	check("demo send stays local", contains(view[..], "does not call a model") && contains(view[..], "\"request\":null"));
+	reset();
+	apply("{\"op\":\"connect\",\"url\":\"http://8.8.8.8\",\"local\":true}");
+	view.clear();
+	render(view);
+	check("connect refuses public http", contains(view[..], "\"request\":null") && contains(view[..], "private address"));
+	apply("{\"op\":\"connect\",\"url\":\"https://opencode.example.com:49374\",\"local\":false}");
+	view.clear();
+	render(view);
+	check("connect requests info", contains(view[..], "\"tag\":\"info\"") && contains(view[..], "\"path\":\"/api/info\"") && contains(view[..], "\"https\":true"));
+	check("view has no password field", !contains(view[..], "password") && !contains(view[..], "Authorization"));
+	apply("{\"op\":\"http\",\"status\":200,\"tag\":\"info\",\"body\":\"{\\\"version\\\":\\\"9.9.9-fixture\\\",\\\"pid\\\":1,\\\"urls\\\":[],\\\"paths\\\":{}}\",\"error\":\"\"}");
+	view.clear();
+	render(view);
+	check("info then projects", contains(view[..], "\"tag\":\"projects\"") && contains(view[..], "OpenCode 9.9.9-fixture"));
+	apply("{\"op\":\"http\",\"status\":200,\"tag\":\"projects\",\"body\":\"[{\\\"id\\\":\\\"p1\\\",\\\"name\\\":\\\"Notes\\\",\\\"canonical\\\":\\\"/srv/notes\\\",\\\"sandboxes\\\":[],\\\"time\\\":{\\\"created\\\":1,\\\"updated\\\":1,\\\"active\\\":1}}]\",\"error\":\"\"}");
+	view.clear();
+	render(view);
+	check("projects then sessions", contains(view[..], "Notes") && contains(view[..], "\"tag\":\"sessions\""));
+	apply("{\"op\":\"http\",\"status\":200,\"tag\":\"sessions\",\"body\":\"{\\\"data\\\":[{\\\"id\\\":\\\"ses_1\\\",\\\"projectID\\\":\\\"p1\\\",\\\"title\\\":\\\"Review fixture\\\",\\\"cost\\\":0,\\\"tokens\\\":{\\\"input\\\":0,\\\"output\\\":0,\\\"reasoning\\\":0,\\\"cache\\\":{}},\\\"time\\\":{},\\\"location\\\":{\\\"directory\\\":\\\"/srv/notes\\\"}}],\\\"cursor\\\":{}}\",\"error\":\"\"}");
+	view.clear();
+	render(view);
+	check("session title", contains(view[..], "Review fixture") && contains(view[..], "\"request\":null"));
+	apply("{\"op\":\"ui\",\"action\":\"open-session\",\"id\":\"ses_1\"}");
+	view.clear();
+	render(view);
+	check("opens message route", contains(view[..], "/api/session/ses_1/message?limit=80&order=asc"));
+	apply("{\"op\":\"http\",\"status\":200,\"tag\":\"messages\",\"body\":\"{\\\"data\\\":[{\\\"id\\\":\\\"m1\\\",\\\"type\\\":\\\"user\\\",\\\"text\\\":\\\"hello\\\",\\\"time\\\":{}},{\\\"id\\\":\\\"m2\\\",\\\"type\\\":\\\"assistant\\\",\\\"agent\\\":\\\"build\\\",\\\"model\\\":{\\\"id\\\":\\\"m\\\",\\\"providerID\\\":\\\"p\\\"},\\\"content\\\":[{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"See\\\\n```\\\\nlet x = 1\\\\n```\\\"},{\\\"type\\\":\\\"tool\\\",\\\"id\\\":\\\"t1\\\",\\\"name\\\":\\\"read\\\",\\\"state\\\":{\\\"status\\\":\\\"completed\\\",\\\"input\\\":{},\\\"content\\\":[{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"README\\\"}]},\\\"time\\\":{}}],\\\"time\\\":{}}],\\\"cursor\\\":{}}\",\"error\":\"\"}");
+	view.clear();
+	render(view);
+	check("message code and tool", contains(view[..], "\"role\":\"code\"") && contains(view[..], "let x = 1") && contains(view[..], "read"));
+	check("then subscribes", contains(view[..], "\"path\":\"/api/event\"") && contains(view[..], "\"stream\":true"));
+	apply("{\"op\":\"http\",\"status\":200,\"tag\":\"events\",\"body\":\"\",\"error\":\"\"}");
+	apply("{\"op\":\"sse\",\"body\":\"{\\\"id\\\":\\\"e1\\\",\\\"type\\\":\\\"server.connected\\\",\\\"data\\\":{}}\"}");
+	apply("{\"op\":\"sse\",\"body\":\"{\\\"id\\\":\\\"e2\\\",\\\"created\\\":1,\\\"type\\\":\\\"session.text.delta\\\",\\\"data\\\":{\\\"sessionID\\\":\\\"ses_1\\\",\\\"assistantMessageID\\\":\\\"asst_9\\\",\\\"ordinal\\\":0,\\\"delta\\\":\\\"streamed \\\"}}\"}");
+	apply("{\"op\":\"sse\",\"body\":\"{\\\"id\\\":\\\"e3\\\",\\\"created\\\":1,\\\"type\\\":\\\"permission.asked\\\",\\\"data\\\":{\\\"id\\\":\\\"perm_9\\\",\\\"sessionID\\\":\\\"ses_1\\\",\\\"action\\\":\\\"bash\\\",\\\"resources\\\":[\\\"npm test\\\"],\\\"message\\\":\\\"Run the fixture tests?\\\"}}\"}");
+	view.clear();
+	render(view);
+	check("delta and permission", contains(view[..], "streamed ") && contains(view[..], "perm_9") && contains(view[..], "Run the fixture tests?"));
+	check("permission does not auto reply", contains(view[..], "\"request\":null"));
+	apply("{\"op\":\"ui\",\"action\":\"permission\",\"id\":\"perm_9\",\"decision\":\"reject\"}");
+	view.clear();
+	render(view);
+	check("reject posts reply", contains(view[..], "\"tag\":\"permission\"") && contains(view[..], "/api/session/ses_1/permission/perm_9/reply") && contains(view[..], "reject"));
+	check("reject is not a shell call", !contains(view[..], "/api/shell") && !contains(view[..], "/shell\""));
+	apply("{\"op\":\"http\",\"status\":204,\"tag\":\"permission\",\"body\":\"\",\"error\":\"\"}");
+	apply("{\"op\":\"ui\",\"action\":\"interrupt\"}");
+	view.clear();
+	render(view);
+	check("interrupt route", contains(view[..], "/api/session/ses_1/interrupt?resume=false") && contains(view[..], "\"method\":\"POST\""));
+	apply("{\"op\":\"http\",\"status\":401,\"tag\":\"info\",\"body\":\"{\\\"_tag\\\":\\\"UnauthorizedError\\\",\\\"message\\\":\\\"no\\\"}\",\"error\":\"\"}");
+	view.clear();
+	render(view);
+	check("unauthorized surfaced", contains(view[..], "refused the password") || contains(view[..], "Unauthorized"));
+	apply("{\"op\":\"stream\",\"state\":\"closed\",\"error\":\"\"}");
+	view.clear();
+	render(view);
+	check("reconnect state", contains(view[..], "reconnecting") || contains(view[..], "Event stream closed"));
+	apply("{\"op\":\"ui\",\"action\":\"send\",\"text\":\"visible only\",\"wire\":\"LOCAL NOTE visible only\"}");
+	view.clear();
+	render(view);
+	check("wire stays off the bubble", contains(view[..], "\"text\":\"visible only\"") && contains(view[..], "LOCAL NOTE") && !contains(view[..], "\"text\":\"LOCAL NOTE"));
+	print("unit_pass ", PASS);
+	print("unit_fail ", FAIL);
+	return FAIL;
+}
+
+fn header_end(buf const byte[:]) int {
+	for i in buf.len {
+		if i + 3 < buf.len && buf[i] == '\r' && buf[i + 1] == '\n' && buf[i + 2] == '\r' && buf[i + 3] == '\n' { return i; }
+	}
+	return -1;
+}
+fn status_of(buf const byte[:]) int {
+	var i = 0;
+	while i < buf.len && buf[i] != ' ' { i += 1; }
+	if i >= buf.len { return 0; }
+	i += 1;
+	var j = i;
+	while j < buf.len && buf[j] >= '0' && buf[j] <= '9' { j += 1; }
+	let v, ok = parse_int(buf[i..j]);
+	if ok { return v; }
+	return 0;
+}
+fn read_http(fd int, out byte[>..]&) int {
+	var idle = 0;
+	while idle < 20 {
+		let ev = net::wait_one(fd, net::READ, 200);
+		if ev <= 0 { idle += 1; continue; }
+		let n = net::recv(fd, out);
+		if n == 0 { return out.len; }
+		if n < 0 && n != net::AGAIN { return n; }
+		if n > 0 { idle = 0; }
+		if header_end(out[..]) >= 0 && out.len > 65536 { return out.len; }
+	}
+	return out.len;
+}
+fn http_call(host const byte[:], port int, method const byte[:], path const byte[:], body const byte[:], extra const byte[:], out byte[>..]&) int {
+	let fd = net::connect(net::addr(host, port));
+	if fd < 0 { return -1; }
+	var ready = net::connected(fd);
+	if ready == net::AGAIN {
+		net::wait_one(fd, net::WRITE, 3000);
+		ready = net::connected(fd);
+	}
+	if ready != 0 { net::close(fd); return -1; }
+	var req byte[>..] = [];
+	req.append(method);
+	req.append(" ");
+	req.append(path);
+	req.append(" HTTP/1.1\r\nHost: ");
+	req.append(host);
+	req.append(":");
+	json::format_int(req, port);
+	req.append("\r\nAccept: application/json\r\nConnection: close\r\n");
+	if extra.len > 0 { req.append(extra); }
+	if body.len > 0 {
+		req.append("Content-Type: application/json\r\nContent-Length: ");
+		json::format_int(req, body.len);
+		req.append("\r\n");
+	}
+	req.append("\r\n");
+	req.append(body);
+	let sent = net::send_all(fd, req[..]);
+	req.clear();
+	if sent < 0 { net::close(fd); return -1; }
+	let n = read_http(fd, out);
+	net::close(fd);
+	return n;
+}
+fn auth_header(out byte[>..]&) {
+	var raw byte[>..] = [];
+	raw.append("opencode:");
+	raw.append(SECRET[..]);
+	var b64 byte[>..] = [];
+	base64::encode(b64, raw[..]);
+	raw.clear();
+	out.append("Authorization: Basic ");
+	out.append(b64[..]);
+	out.append("\r\n");
+	b64.clear();
+}
+fn expect_status(name const byte[:], raw const byte[:], want int) {
+	check(name, status_of(raw) == want);
+}
+fn run_contract(port int) int {
+	PASS = 0;
+	FAIL = 0;
+	SECRET.clear();
+	if !env("COMPANION_PASSWORD", SECRET) || SECRET.len == 0 {
+		check("password env", false);
+		print("contract_fail ", FAIL);
+		return FAIL;
+	}
+	var auth byte[>..] = [];
+	auth_header(auth);
+	var raw byte[>..] = [];
+	let n1 = http_call("127.0.0.1", port, "GET", "/api/info", "", auth[..], raw);
+	check("info transport", n1 > 0);
+	expect_status("info 200", raw[..], 200);
+	check("info version", contains(raw[..], "\"version\":\"9.9.9-contract\""));
+	raw.clear();
+	let n2 = http_call("127.0.0.1", port, "GET", "/api/project", "", auth[..], raw);
+	check("projects transport", n2 > 0);
+	expect_status("projects 200", raw[..], 200);
+	check("project name", contains(raw[..], "Contract notes"));
+	raw.clear();
+	let n3 = http_call("127.0.0.1", port, "GET", "/api/session?limit=50&order=desc", "", auth[..], raw);
+	check("sessions transport", n3 > 0);
+	expect_status("sessions 200", raw[..], 200);
+	check("session id", contains(raw[..], "ses_contract"));
+	raw.clear();
+	let n4 = http_call("127.0.0.1", port, "GET", "/api/session/ses_contract/message?limit=80&order=asc", "", auth[..], raw);
+	check("messages transport", n4 > 0);
+	expect_status("messages 200", raw[..], 200);
+	check("message text", contains(raw[..], "contract hello"));
+	raw.clear();
+	let body = "{\"text\":\"Review the fixture\"}";
+	let n5 = http_call("127.0.0.1", port, "POST", "/api/session/ses_contract/prompt", body, auth[..], raw);
+	check("prompt transport", n5 > 0);
+	expect_status("prompt 200", raw[..], 200);
+	check("prompt echo", contains(raw[..], "Review the fixture"));
+	raw.clear();
+	let n6 = http_call("127.0.0.1", port, "GET", "/api/event", "", auth[..], raw);
+	check("event transport", n6 > 0);
+	expect_status("event 200", raw[..], 200);
+	check("sse connected", contains(raw[..], "server.connected"));
+	check("sse permission", contains(raw[..], "permission.asked"));
+	raw.clear();
+	let reply = "{\"decision\":\"once\"}";
+	let n7 = http_call("127.0.0.1", port, "POST", "/api/session/ses_contract/permission/perm_contract/reply", reply, auth[..], raw);
+	check("reply transport", n7 > 0);
+	expect_status("reply 204", raw[..], 204);
+	raw.clear();
+	let n8 = http_call("127.0.0.1", port, "POST", "/api/session/ses_contract/interrupt?resume=false", "", auth[..], raw);
+	check("interrupt transport", n8 > 0);
+	expect_status("interrupt 200", raw[..], 200);
+	check("interrupt flag", contains(raw[..], "\"interrupted\":true"));
+	raw.clear();
+	let n9 = http_call("127.0.0.1", port, "GET", "/api/info", "", "", raw);
+	check("missing auth is 401", status_of(raw[..]) == 401);
+	// The view model must not contain the fixture password.
+	reset();
+	apply("{\"op\":\"connect\",\"url\":\"http://127.0.0.1:9\",\"local\":true}");
+	var view byte[>..] = [];
+	render(view);
+	check("secret stays out of view", !contains(view[..], SECRET[..]));
+	auth.clear();
+	print("contract_pass ", PASS);
+	print("contract_fail ", FAIL);
+	return FAIL;
+}
+
+export "companion_handle" fn handle(event const byte[:], out byte[>..]&) int {
+	apply(event);
+	render(out);
+	return out.len;
+}

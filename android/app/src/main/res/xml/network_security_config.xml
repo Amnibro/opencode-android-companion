@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Release and default: HTTPS with the system trust store only.
+     The debug source set replaces this file so a private-host HTTP server
+     can be reached. The app still refuses public cleartext itself. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

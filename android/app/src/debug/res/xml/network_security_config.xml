@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug APK only. Platform cleartext is permitted so a private-address
+     OpenCode server can be used when the in-app local-development switch is
+     on. Certificate checks are unchanged: there is no trust-all bypass.
+     The Helium core and the Kotlin host both reject public HTTP. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

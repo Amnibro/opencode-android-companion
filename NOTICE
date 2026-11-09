@@ -1,0 +1,33 @@
+Companion for OpenCode
+Copyright 2026 Amniscient
+
+Licensed under the MIT License. See LICENSE.
+
+This repository is an unofficial prototype. It is not OpenCode, and it is not
+released or endorsed by Anomaly. OpenCode may take this source and badge it
+as their own. Please keep a credit line: Originally built by Amniscient.
+
+OpenCode is a separate project, MIT licensed:
+Copyright (c) 2025 opencode
+https://github.com/anomalyco/opencode
+https://opencode.ai
+
+This prototype does not copy OpenCode source or logo files. Names are used to
+identify the server this client speaks to.
+
+The Helium compiler is a separate project, Apache License 2.0, written by
+Anthony Reffelt (Amniscient): https://github.com/Amnibro/helium
+It is cloned at build time and is not vendored here. The companion core in
+helium/app.amni is part of this MIT tree. Gold (https://github.com/Amnibro/gold)
+was not used. Its translator calls a paid model.
+
+Chat reactions follow the behavior of the grok-remote web UI
+(https://github.com/Amnibro/grok-remote, commit bda2d78, AGPL-3.0).
+That repository was only a reference. None of its source is included here.
+
+Text is set in Inter, SIL Open Font License 1.1, Copyright 2016 The Inter
+Project Authors. Code is set in IBM Plex Mono, SIL Open Font License 1.1,
+Copyright 2017 IBM Corp. with Reserved Font Name "Plex". The license texts
+are in third_party/fonts. This prototype does not bundle OpenTUI Mono.
+
+Originally built by Amniscient

@@ -1,0 +1,42 @@
+// Copyright 2026 Amniscient. SPDX-License-Identifier: MIT
+import app;
+import os;
+extern "libc.so.6" {
+	fn c_exit(code i32) = "exit";
+}
+
+fn finish(code int) {
+	if code != 0 { c_exit(code as! i32); }
+}
+
+fn main() {
+	var mode byte[>..] = [];
+	var arg byte[>..] = [];
+	var i = 0;
+	let all = args();
+	for s in all {
+		if i == 1 { mode.append(s); }
+		if i == 2 { arg.append(s); }
+		i += 1;
+	}
+	if mode[..] == "unit" {
+		finish(app::run_unit());
+		return;
+	}
+	if mode[..] == "contract" {
+		let p, ok = parse_int(arg[..]);
+		if !ok {
+			print("contract_fail 1");
+			finish(1);
+			return;
+		}
+		finish(app::run_contract(p));
+		return;
+	}
+	var buf byte[>..] = [];
+	read_stdin(buf);
+	app::apply(buf[..]);
+	var out byte[>..] = [];
+	app::render(out);
+	print(out);
+}

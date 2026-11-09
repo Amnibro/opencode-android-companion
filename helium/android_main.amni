@@ -1,0 +1,4 @@
+// Copyright 2026 Amniscient. SPDX-License-Identifier: MIT
+import app;
+
+fn main() { }
